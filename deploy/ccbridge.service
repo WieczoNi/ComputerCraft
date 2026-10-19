@@ -1,0 +1,15 @@
+[Unit]
+Description=ccbridge relay (ComputerCraft <-> web/Claude)
+After=network.target
+
+[Service]
+Type=simple
+User=ccbridge
+WorkingDirectory=/opt/ccbridge/server
+EnvironmentFile=/opt/ccbridge/.env
+ExecStart=/usr/bin/node server.js
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

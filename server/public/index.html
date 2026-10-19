@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ccbridge</title>
+<style>
+  :root {
+    --bg: #1b1d22; --panel: #24272e; --border: #353943; --text: #e4e6eb; --muted: #8b919c;
+    --accent: #7fcc19; --danger: #cc4c4c;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px system-ui, sans-serif; background: var(--bg); color: var(--text); }
+  header { display: flex; align-items: center; gap: 12px; padding: 10px 16px; border-bottom: 1px solid var(--border); }
+  header h1 { font-size: 16px; margin: 0; }
+  #conn { font-size: 12px; color: var(--muted); }
+  main { display: grid; grid-template-columns: 220px 1fr; min-height: calc(100vh - 45px); }
+  @media (max-width: 760px) { main { grid-template-columns: 1fr; } }
+  aside { border-right: 1px solid var(--border); padding: 8px; }
+  .comp { display: block; width: 100%; text-align: left; padding: 8px 10px; margin-bottom: 4px; border-radius: 6px;
+          background: none; border: 1px solid transparent; color: var(--text); cursor: pointer; font: inherit; }
+  .comp:hover { background: var(--panel); }
+  .comp.sel { background: var(--panel); border-color: var(--border); }
+  .comp small { display: block; color: var(--muted); }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; background: var(--muted); }
+  .dot.on { background: var(--accent); }
+  section { padding: 16px; min-width: 0; }
+  .term { display: inline-block; font: 16px/1.15 "Cascadia Mono", "DejaVu Sans Mono", monospace; background: #111;
+          padding: 8px; border: 2px solid var(--border); border-radius: 4px; outline: none; white-space: pre; max-width: 100%; overflow-x: auto; }
+  .term:focus { border-color: var(--accent); }
+  .term .cur { animation: blink 1s steps(1) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+  .bar { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0; }
+  button.b { background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 6px;
+             padding: 6px 10px; cursor: pointer; font: inherit; }
+  button.b:hover { border-color: var(--muted); }
+  button.danger { color: var(--danger); }
+  .pad { display: grid; grid-template-columns: repeat(3, 44px); gap: 4px; }
+  .pad button { height: 36px; padding: 0; }
+  .cols { display: flex; flex-wrap: wrap; gap: 24px; margin-top: 12px; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 0 0 8px; }
+  textarea { width: min(520px, 100%); height: 90px; background: var(--panel); color: var(--text); border: 1px solid var(--border);
+             border-radius: 6px; font: 13px monospace; padding: 8px; }
+  pre.out { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 8px; max-width: 520px;
+            overflow: auto; font-size: 12px; max-height: 260px; margin: 6px 0 0; }
+  #login { max-width: 360px; margin: 80px auto; display: flex; flex-direction: column; gap: 8px; padding: 0 16px; }
+  #login input { padding: 8px; background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 6px; }
+  .muted { color: var(--muted); }
+</style>
+</head>
+<body>
+<header><h1>ccbridge</h1><span id="conn">disconnected</span></header>
+
+<div id="login" hidden>
+  <label for="tok">API token</label>
+  <input id="tok" type="password" autocomplete="current-password">
+  <button class="b" id="loginBtn">Connect</button>
+</div>
+
+<main id="app" hidden>
+  <aside id="list"></aside>
+  <section id="detail"><p class="muted">Select a computer.</p></section>
+</main>
+
+<script>
+const PALETTE = {
+  "0": "#F0F0F0", "1": "#F2B233", "2": "#E57FD8", "3": "#99B2F2", "4": "#DEDE6C", "5": "#7FCC19", "6": "#F2B2CC", "7": "#4C4C4C",
+  "8": "#999999", "9": "#4C99B2", "a": "#B266E5", "b": "#3366CC", "c": "#7F664C", "d": "#57A64E", "e": "#CC4C4C", "f": "#111111",
+};
+// Browser key -> CC `keys` name for non-printable keys.
+const KEYMAP = {
+  Enter: "enter", Backspace: "backspace", Tab: "tab", Delete: "delete",
+  ArrowUp: "up", ArrowDown: "down", ArrowLeft: "left", ArrowRight: "right",
+  Home: "home", End: "end", PageUp: "pageUp", PageDown: "pageDown", Insert: "insert",
+  Control: "leftCtrl", Alt: "leftAlt", Shift: "leftShift",
+  F1: "f1", F2: "f2", F3: "f3", F4: "f4", F5: "f5", F6: "f6", F7: "f7", F8: "f8", F9: "f9", F10: "f10", F11: "f11", F12: "f12",
+};
+
+const base = location.href.replace(/[?#].*$/, "").replace(/[^/]*$/, "");
+let token = "";
+try { token = localStorage.getItem("ccbridge.token") || ""; } catch {}
+let ws = null, computers = [], screens = {}, selected = null;
+
+const $ = (s) => document.querySelector(s);
+const esc = (s) => s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+
+async function api(method, p, body) {
+  const r = await fetch(base + "api/" + p, {
+    method, headers: { authorization: "Bearer " + token, "content-type": "application/json" },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || r.statusText);
+  return data;
+}
+
+function connect() {
+  $("#login").hidden = true;
+  $("#app").hidden = false;
+  ws = new WebSocket(base.replace(/^http/, "ws") + "ws/ui?token=" + encodeURIComponent(token));
+  ws.onopen = () => { $("#conn").textContent = "connected"; };
+  ws.onclose = (e) => {
+    $("#conn").textContent = "disconnected — retrying";
+    if (!ws.everOpened && e.code === 1006 && !computers.length) return showLogin("Could not connect (bad token?)");
+    setTimeout(connect, 3000);
+  };
+  ws.addEventListener("open", () => { ws.everOpened = true; });
+  ws.onmessage = (ev) => {
+    const msg = JSON.parse(ev.data);
+    if (msg.type === "computers") { computers = msg.computers; renderList(); if (selected != null) renderDetail(false); }
+    else if (msg.type === "screen") { screens[msg.id] = msg.screen; if (msg.id === selected) renderScreen(); }
+  };
+}
+
+function showLogin(err) {
+  $("#app").hidden = true;
+  $("#login").hidden = false;
+  $("#conn").textContent = err || "not logged in";
+}
+
+$("#loginBtn").onclick = () => {
+  token = $("#tok").value.trim();
+  try { localStorage.setItem("ccbridge.token", token); } catch {}
+  connect();
+};
+$("#tok").onkeydown = (e) => { if (e.key === "Enter") $("#loginBtn").click(); };
+
+function renderList() {
+  const sorted = [...computers].sort((a, b) => (b.online - a.online) || (a.id - b.id));
+  $("#list").innerHTML = sorted.map((c) => `
+    <button class="comp ${c.id === selected ? "sel" : ""}" data-id="${c.id}">
+      <span class="dot ${c.online ? "on" : ""}"></span>${esc(c.label || "Computer")} #${c.id}
+      <small>${c.turtle ? "turtle" : c.pocket ? "pocket" : "computer"}${c.advanced ? " · advanced" : ""}</small>
+    </button>`).join("") || `<p class="muted">No computers yet. Run the agent in-game.</p>`;
+  for (const b of $("#list").querySelectorAll(".comp")) b.onclick = () => { selected = Number(b.dataset.id); renderList(); renderDetail(true); };
+}
+
+function renderScreen() {
+  const s = screens[selected], el = $("#term");
+  if (!el) return;
+  if (!s) { el.textContent = "(no screen yet)"; return; }
+  let html = "";
+  for (let y = 0; y < s.height; y++) {
+    const text = s.lines[y], fg = s.fg[y], bg = s.bg[y];
+    for (let x = 0; x < text.length; x++) {
+      let ch = text[x];
+      const code = ch.charCodeAt(0);
+      if (code < 32 || (code >= 127 && code < 160)) ch = code >= 128 && code < 160 ? "▒" : " ";
+      const cursor = s.cursor.blink && s.cursor.x === x + 1 && s.cursor.y === y + 1;
+      const style = `color:${PALETTE[fg[x]] || "#fff"};background:${PALETTE[bg[x]] || "#111"}`;
+      html += `<span style="${style}">${cursor ? `<span class="cur" style="text-decoration:underline">${esc(ch)}</span>` : esc(ch)}</span>`;
+    }
+    html += "\n";
+  }
+  el.innerHTML = html;
+}
+
+function sendInput(events) {
+  if (ws?.readyState === 1) ws.send(JSON.stringify({ type: "input", id: selected, events }));
+}
+
+function renderDetail(fresh) {
+  const c = computers.find((x) => x.id === selected);
+  if (!c) return;
+  if (!fresh && $("#detail").dataset.id === String(c.id)) {
+    $("#detailTitle").innerHTML = title(c);
+    return;
+  }
+  $("#detail").dataset.id = c.id;
+  $("#detail").innerHTML = `
+    <h2 id="detailTitle">${title(c)}</h2>
+    <div class="term" id="term" tabindex="0"></div>
+    <div class="bar">
+      <button class="b" data-act="terminate">Ctrl+T (terminate)</button>
+      <button class="b" data-act="paste">Paste…</button>
+      <button class="b" data-act="update">Update agent</button>
+      <button class="b danger" data-act="reboot">Reboot</button>
+    </div>
+    <div class="cols">
+      ${c.turtle ? `<div>
+        <h2>Turtle</h2>
+        <div class="pad">
+          <button class="b" data-t="digUp">⛏↑</button><button class="b" data-t="forward">▲</button><button class="b" data-t="up">⤒</button>
+          <button class="b" data-t="turnLeft">⟲</button><button class="b" data-t="dig">⛏</button><button class="b" data-t="turnRight">⟳</button>
+          <button class="b" data-t="digDown">⛏↓</button><button class="b" data-t="back">▼</button><button class="b" data-t="down">⤓</button>
+        </div>
+        <div class="bar"><button class="b" data-t="place">Place</button><button class="b" data-t="refuel">Refuel</button>
+          <button class="b" data-act="status">Status</button></div>
+      </div>` : ""}
+      <div>
+        <h2>Lua</h2>
+        <textarea id="code" placeholder="return turtle.getFuelLevel()"></textarea>
+        <div class="bar"><button class="b" id="run">Run (Ctrl+Enter)</button></div>
+        <pre class="out" id="out" hidden></pre>
+      </div>
+    </div>`;
+  renderScreen();
+
+  const term = $("#term");
+  term.onkeydown = (e) => {
+    if (e.ctrlKey && e.key === "v") return; // let the paste event handle it
+    if (KEYMAP[e.key]) { e.preventDefault(); sendInput([["key", KEYMAP[e.key]]]); return; }
+    if (e.ctrlKey && /^[a-z]$/i.test(e.key)) { e.preventDefault(); sendInput([["key", "leftCtrl"], ["key", e.key.toLowerCase()]]); return; }
+    if (e.key.length === 1 && !e.metaKey) {
+      e.preventDefault();
+      const events = [["char", e.key]];
+      if (/^[a-z0-9 ]$/i.test(e.key)) events.unshift(["key", e.key === " " ? "space" : e.key.toLowerCase()]);
+      sendInput(events);
+    }
+  };
+  term.onpaste = (e) => { e.preventDefault(); sendInput([["paste", e.clipboardData.getData("text")]]); };
+  term.focus();
+
+  const out = $("#out");
+  const show = (data) => { out.hidden = false; out.textContent = typeof data === "string" ? data : JSON.stringify(data, null, 2); };
+  const guard = (fn) => async () => { try { show(await fn()); } catch (e) { show("Error: " + e.message); } };
+
+  for (const b of $("#detail").querySelectorAll("[data-act]")) {
+    const act = b.dataset.act;
+    b.onclick = guard(async () => {
+      if (act === "paste") { const t = prompt("Text to paste"); if (t) sendInput([["paste", t]]); term.focus(); return "pasted"; }
+      if (act === "status") return api("POST", `computers/${c.id}/status`, {});
+      if (act === "reboot" && !confirm("Reboot this computer?")) return "cancelled";
+      const r = await api("POST", `computers/${c.id}/${act}`, {});
+      term.focus();
+      return r;
+    });
+  }
+  for (const b of $("#detail").querySelectorAll("[data-t]")) {
+    b.onclick = guard(() => api("POST", `computers/${c.id}/turtle`, { action: b.dataset.t }));
+  }
+  const runCode = guard(() => api("POST", `computers/${c.id}/eval`, { code: $("#code").value }));
+  $("#run").onclick = runCode;
+  $("#code").onkeydown = (e) => { if (e.key === "Enter" && e.ctrlKey) { e.preventDefault(); runCode(); } };
+}
+
+function title(c) {
+  return `<span class="dot ${c.online ? "on" : ""}"></span>${esc(c.label || "Computer")} #${c.id} ${c.online ? "" : "(offline)"}`;
+}
+
+if (token) connect(); else showLogin();
+</script>
+</body>
+</html>
