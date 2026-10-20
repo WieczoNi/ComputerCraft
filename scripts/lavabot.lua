@@ -1,4 +1,5 @@
 -- lavabot: harvest a ceiling grid of lava cauldrons every 15 minutes (or on a redstone pulse).
+-- Run in the background by the ccbridge agent: set ccbridge.autorun { "lavabot.lua" }.
 --
 -- Home: on the oak planks, facing the deposit drawer (full buckets), with the
 -- empties drawer to the right. The cauldron grid hangs 3 blocks up; the

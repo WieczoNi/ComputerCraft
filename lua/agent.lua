@@ -2,7 +2,7 @@
 -- Install in-game with:  wget __CCBRIDGE_URL__/agent.lua startup.lua
 -- The relay substitutes __CCBRIDGE_URL__ when serving this file.
 
-local VERSION = "0.1.0"
+local VERSION = "0.2.0"
 local BASE_URL = "__CCBRIDGE_URL__"
 
 settings.define("ccbridge.url", {
@@ -14,6 +14,22 @@ settings.define("ccbridge.token", {
     description = "Agent token for the ccbridge relay",
     type = "string",
 })
+settings.define("ccbridge.remote_only", {
+    description = "Ignore the in-game keyboard/mouse and hide the screen; only the relay can use this computer",
+    default = true,
+    type = "boolean",
+})
+settings.define("ccbridge.autorun", {
+    description = "Programs the agent runs in the background at boot, e.g. { \"sign.lua\" }",
+    default = {},
+    type = "table",
+})
+
+-- A floppy with its own startup would otherwise run instead of us.
+if settings.get("shell.allow_disk_startup") ~= false then
+    settings.set("shell.allow_disk_startup", false)
+    settings.save()
+end
 
 local function baseUrl()
     return (settings.get("ccbridge.url"):gsub("/+$", ""))
@@ -36,7 +52,33 @@ end
 
 local native = term.current()
 local w, h = native.getSize()
-local win = window.create(native, 1, 1, w, h, true)
+local remoteOnly = settings.get("ccbridge.remote_only")
+-- In remote-only mode the shell draws into a hidden window (still mirrored to the relay)
+-- and the real screen only shows a notice.
+local win = window.create(native, 1, 1, w, h, not remoteOnly)
+
+local function drawNotice(lines)
+    native.setBackgroundColour(colours.black)
+    native.clear()
+    native.setCursorBlink(false)
+    local y0 = math.floor((h - #lines) / 2) + 1
+    for i, line in ipairs(lines) do
+        native.setTextColour(i == 1 and colours.yellow or colours.lightGrey)
+        native.setCursorPos(math.max(1, math.floor((w - #line) / 2) + 1), y0 + i - 1)
+        native.write(line)
+    end
+end
+
+-- Hand the computer back to the in-game player (agent crashed or token rejected).
+local function unlockLocal(reason)
+    if not remoteOnly then return end
+    remoteOnly = false
+    native.setTextColour(colours.white)
+    native.clear()
+    win.setVisible(true)
+    win.redraw()
+    if reason then printError("ccbridge: " .. reason .. " - local input unlocked") end
+end
 
 ---------------------------------------------------------------------------
 -- Tiny cooperative scheduler so the shell, the network loop and remote jobs
@@ -210,21 +252,23 @@ end
 local function queueInput(events)
     for _, e in ipairs(events or {}) do
         local kind = e[1]
+        -- Remote input is queued under its own name so the main loop can tell it
+        -- apart from the in-game keyboard (see LOCAL_INPUT below).
         if kind == "key" then
             local code = keys[e[2]]
             if code then
-                os.queueEvent("key", code, false)
-                if e[3] ~= "hold" then os.queueEvent("key_up", code) end
+                os.queueEvent("ccbridge_input", "key", code, false)
+                if e[3] ~= "hold" then os.queueEvent("ccbridge_input", "key_up", code) end
             end
         elseif kind == "key_up" then
             local code = keys[e[2]]
-            if code then os.queueEvent("key_up", code) end
+            if code then os.queueEvent("ccbridge_input", "key_up", code) end
         elseif kind == "char" then
-            for c in tostring(e[2]):gmatch(".") do os.queueEvent("char", c) end
+            for c in tostring(e[2]):gmatch(".") do os.queueEvent("ccbridge_input", "char", c) end
         elseif kind == "paste" then
-            os.queueEvent("paste", tostring(e[2]))
+            os.queueEvent("ccbridge_input", "paste", tostring(e[2]))
         elseif kind == "terminate" then
-            os.queueEvent("terminate")
+            os.queueEvent("ccbridge_input", "terminate")
         end
     end
 end
@@ -306,8 +350,11 @@ local function netLoop()
                     local ok, msg = pcall(textutils.unserialiseJSON, ev[3])
                     if ok and type(msg) == "table" then
                         if msg.type == "error" then
-                            -- Relay rejected us (e.g. bad token); show it on screen.
+                            -- Relay rejected us (e.g. bad token): without local input there
+                            -- would be no way to fix it, so unlock and show the error.
+                            unlockLocal(tostring(msg.message))
                             print("ccbridge: " .. tostring(msg.message))
+                            print("Fix with: set ccbridge.token <token>, then reboot")
                         else
                             handle(msg)
                         end
@@ -335,9 +382,6 @@ local function shellLoop()
     end
 end
 
-term.redirect(win)
-win.clear()
-win.setCursorPos(1, 1)
 
 local function netMain()
     while true do
@@ -348,22 +392,58 @@ local function netMain()
     end
 end
 
-spawn(shellLoop)
-spawn(netMain, { isNet = true })
 
-while true do
-    local ev = table.pack(os.pullEventRaw())
-    local name = ev[1]
-    local snapshotTasks = { table.unpack(tasks) }
-    for _, t in ipairs(snapshotTasks) do
-        if not t.dead then
-            local wants = t.filter == nil or t.filter == name
-            -- Ctrl+T in-game only goes to the shell and remote jobs, never the net loop.
-            if name == "terminate" then wants = not t.isNet end
-            if wants then resumeTask(t, table.unpack(ev, 1, ev.n)) end
+-- Events that come from a player at the in-game computer. In remote-only mode
+-- they are dropped; the relay's input arrives as "ccbridge_input" instead.
+local LOCAL_INPUT = {
+    key = true, key_up = true, char = true, paste = true, terminate = true,
+    mouse_click = true, mouse_up = true, mouse_drag = true, mouse_scroll = true,
+}
+
+local function mainLoop()
+    term.redirect(win)
+    win.clear()
+    win.setCursorPos(1, 1)
+    if remoteOnly then
+        drawNotice({ "Remote access only", os.getComputerLabel() or ("Computer #" .. os.getComputerID()),
+            "Managed via ccbridge" })
+    end
+    spawn(shellLoop)
+    spawn(netMain, { isNet = true })
+    for _, program in ipairs(settings.get("ccbridge.autorun") or {}) do
+        spawn(function()
+            local ok = shell.run(program)
+            printError("ccbridge: autorun " .. program .. (ok and " finished" or " failed"))
+        end)
+    end
+    while true do
+        local ev = table.pack(os.pullEventRaw())
+        if ev[1] == "ccbridge_input" then
+            ev = table.pack(table.unpack(ev, 2, ev.n))
+        elseif remoteOnly and LOCAL_INPUT[ev[1]] then
+            ev = nil
+        end
+        if ev then
+            local name = ev[1]
+            local snapshotTasks = { table.unpack(tasks) }
+            for _, t in ipairs(snapshotTasks) do
+                if not t.dead then
+                    local wants = t.filter == nil or t.filter == name
+                    -- Ctrl+T only goes to the shell, autorun programs and remote jobs, never the net loop.
+                    if name == "terminate" then wants = not t.isNet end
+                    if wants then resumeTask(t, table.unpack(ev, 1, ev.n)) end
+                end
+            end
+            for i = #tasks, 1, -1 do
+                if tasks[i].dead then table.remove(tasks, i) end
+            end
         end
     end
-    for i = #tasks, 1, -1 do
-        if tasks[i].dead then table.remove(tasks, i) end
-    end
 end
+
+-- If the agent itself breaks (here or while starting up), give the computer back to the
+-- in-game player instead of leaving it locked with nothing listening.
+local ok, err = pcall(mainLoop)
+term.redirect(native)
+unlockLocal()
+printError("ccbridge agent stopped: " .. tostring(err))

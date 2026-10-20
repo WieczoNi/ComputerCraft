@@ -60,8 +60,16 @@ It asks for the `AGENT_TOKEN` once (stored with `settings`), then keeps running 
 Give computers labels (`label set miner1`) so they're easy to tell apart. Later updates:
 "Update agent" in the web UI or the `update_agent` tool — no need to touch the computer again.
 
-> If the computer already has a `startup.lua`, rename it first; the agent starts a normal shell, so you can
-> still run your old program from there (or add it to the agent later).
+> If the computer already has a `startup.lua`, rename it first and add it to `ccbridge.autorun` (below).
+
+**Remote-only by default.** Once the token is set, the agent ignores the in-game keyboard, mouse and Ctrl+T and
+the screen only shows a "Remote access only" notice; the web terminal, REST API and MCP keep full access. It also
+sets `shell.allow_disk_startup` to false so a floppy can't boot in its place. To give a computer back to the
+player: `settings.set("ccbridge.remote_only", false) settings.save()` via eval, then reboot. If the agent crashes or
+the relay rejects the token, local input unlocks so the computer can still be fixed in-game.
+
+**Background programs.** `ccbridge.autorun` lists programs the agent runs at boot next to the shell, e.g. via eval
+`settings.set("ccbridge.autorun", { "sign.lua" }) settings.save()`. They share the agent's input filter.
 
 ## 3. Web terminal
 
@@ -113,7 +121,10 @@ All endpoints need `Authorization: Bearer <API_TOKEN>`.
 
 `eval` is remote code execution on your in-game computers — keep both tokens secret, only expose the
 relay over HTTPS, and rotate tokens by editing `.env` and restarting (`AGENT_TOKEN` changes need
-`set ccbridge.token <new>` in-game).
+`set ccbridge.token <new>` in-game, or via eval before restarting the relay).
+
+Remote-only mode keeps other players out, not the Minecraft server's operators: files (including the agent token
+in `.settings`) live in the world save, and ops in creative can always get at a computer.
 
 ## Development
 

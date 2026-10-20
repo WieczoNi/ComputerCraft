@@ -1,5 +1,5 @@
 -- sign: "Lava Factory", a winking face and a strip of glowing lava on the attached monitor.
--- Started by startup.lua next to the ccbridge agent. Ignores Ctrl+T.
+-- Run in the background by the ccbridge agent: set ccbridge.autorun { "sign.lua" }. Ignores Ctrl+T.
 local WINK_EVERY = 20  -- seconds between winks
 -- Wink animation as {lid stage, seconds}: 0 open, 1-2 closing, 3 shut.
 local WINK = { { 1, 0.2 }, { 2, 0.2 }, { 3, 2.0 }, { 2, 0.2 }, { 1, 0.2 } }
