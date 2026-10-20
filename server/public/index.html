@@ -10,6 +10,7 @@
     --accent: #7fcc19; --danger: #cc4c4c;
   }
   * { box-sizing: border-box; }
+  [hidden] { display: none !important; } /* #login's display:flex would otherwise beat the hidden attribute */
   body { margin: 0; font: 14px system-ui, sans-serif; background: var(--bg); color: var(--text); }
   header { display: flex; align-items: center; gap: 12px; padding: 10px 16px; border-bottom: 1px solid var(--border); }
   header h1 { font-size: 16px; margin: 0; }
@@ -46,6 +47,25 @@
   #login { max-width: 360px; margin: 80px auto; display: flex; flex-direction: column; gap: 8px; padding: 0 16px; }
   #login input { padding: 8px; background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 6px; }
   .muted { color: var(--muted); }
+  .drop { outline: 2px dashed var(--accent); outline-offset: 2px; }
+  .files { margin-top: 20px; max-width: 760px; padding: 4px; border-radius: 6px; }
+  .files table { border-collapse: collapse; width: 100%; }
+  .files td { padding: 4px 8px; border-bottom: 1px solid var(--border); }
+  .files td.size { color: var(--muted); text-align: right; white-space: nowrap; }
+  .files td.act { text-align: right; white-space: nowrap; }
+  .link { background: none; border: 0; color: var(--accent); cursor: pointer; font: inherit; padding: 0; }
+  .link:hover { text-decoration: underline; }
+  pre.code { background: #111; border: 1px solid var(--border); border-radius: 6px; padding: 10px; overflow: auto;
+             max-height: 60vh; font: 12px/1.4 "Cascadia Mono", "DejaVu Sans Mono", monospace; margin: 6px 0 0; }
+  .vhead { display: flex; align-items: center; gap: 8px; margin-top: 14px; }
+  .lib { display: grid; gap: 8px; max-width: 760px; padding: 4px; border-radius: 6px; }
+  .script { background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; cursor: grab; }
+  .script .sdesc { color: var(--muted); white-space: pre-wrap; margin: 4px 0 6px; font-size: 13px; }
+  .script .bar { margin: 0; align-items: center; }
+  .script code, p code { font-size: 12px; background: #111; padding: 2px 5px; border-radius: 4px; }
+  .comp.libbtn { border-color: var(--border); margin-bottom: 10px; }
+  #toast { position: fixed; bottom: 16px; right: 16px; background: var(--panel); border: 1px solid var(--border);
+           border-radius: 6px; padding: 8px 12px; max-width: 420px; white-space: pre-wrap; }
 </style>
 </head>
 <body>
@@ -61,6 +81,7 @@
   <aside id="list"></aside>
   <section id="detail"><p class="muted">Select a computer.</p></section>
 </main>
+<div id="toast" hidden></div>
 
 <script>
 const PALETTE = {
@@ -82,7 +103,7 @@ try { token = localStorage.getItem("ccbridge.token") || ""; } catch {}
 let ws = null, computers = [], screens = {}, selected = null;
 
 const $ = (s) => document.querySelector(s);
-const esc = (s) => s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+const esc = (s) => s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
 async function api(method, p, body) {
   const r = await fetch(base + "api/" + p, {
@@ -92,6 +113,72 @@ async function api(method, p, body) {
   const data = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(data.error || r.statusText);
   return data;
+}
+
+// Raw file transfer (body is bytes, not JSON).
+async function apiRaw(method, p, body) {
+  const r = await fetch(base + "api/" + p, { method, headers: { authorization: "Bearer " + token }, body });
+  if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.statusText);
+  return r;
+}
+
+let toastTimer;
+function toast(msg) {
+  const t = $("#toast");
+  t.textContent = msg;
+  t.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { t.hidden = true; }, 4000);
+}
+
+const fmtSize = (n) => n < 1024 ? `${n} B` : `${(n / 1024).toFixed(1)} KB`;
+const joinPath = (dir, name) => (dir.replace(/\/+$/, "") + "/" + name).replace(/^\/+/, "/");
+
+function saveBlob(blob, name) {
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+
+// What was dropped: a library script (dragged from the Scripts view) or files from the desktop.
+// Both getData and the file list must be read before the first await.
+async function droppedItems(e) {
+  const lib = e.dataTransfer.getData("application/x-ccbridge-script");
+  if (lib) {
+    const r = await fetch(base + "scripts/" + encodeURIComponent(lib));
+    if (!r.ok) throw new Error(`could not load ${lib}`);
+    return [{ name: lib, data: await r.arrayBuffer() }];
+  }
+  return Promise.all([...e.dataTransfer.files].map(async (f) => ({ name: f.name, data: await f.arrayBuffer() })));
+}
+
+function makeDropTarget(el, onDrop) {
+  el.addEventListener("dragover", (e) => { e.preventDefault(); el.classList.add("drop"); });
+  el.addEventListener("dragleave", (e) => { if (!el.contains(e.relatedTarget)) el.classList.remove("drop"); });
+  el.addEventListener("drop", async (e) => {
+    e.preventDefault();
+    el.classList.remove("drop");
+    try {
+      const items = await droppedItems(e);
+      if (items.length) await onDrop(items);
+    } catch (err) { toast("Error: " + err.message); }
+  });
+}
+
+/** Copy dropped items into a folder on a computer, asking before overwriting. */
+async function uploadTo(id, dir, items) {
+  const listing = await api("GET", `computers/${id}/files?path=${encodeURIComponent(dir)}`);
+  const existing = new Set(listing.entries.map((e) => e.name));
+  const done = [];
+  for (const it of items) {
+    if (existing.has(it.name) && !confirm(`${it.name} already exists in ${listing.path} on #${id}. Overwrite it?`)) continue;
+    await apiRaw("PUT", `computers/${id}/file?path=${encodeURIComponent(joinPath(dir, it.name))}`, it.data);
+    done.push(it.name);
+  }
+  if (done.length) toast(`Copied ${done.join(", ")} to ${listing.path} on #${id}`);
+  return done;
 }
 
 function connect() {
@@ -127,12 +214,132 @@ $("#tok").onkeydown = (e) => { if (e.key === "Enter") $("#loginBtn").click(); };
 
 function renderList() {
   const sorted = [...computers].sort((a, b) => (b.online - a.online) || (a.id - b.id));
-  $("#list").innerHTML = sorted.map((c) => `
+  $("#list").innerHTML = `
+    <button class="comp libbtn ${selected === "lib" ? "sel" : ""}" id="libBtn">Script library
+      <small>view, download, drag onto a computer</small></button>` +
+    (sorted.map((c) => `
     <button class="comp ${c.id === selected ? "sel" : ""}" data-id="${c.id}">
       <span class="dot ${c.online ? "on" : ""}"></span>${esc(c.label || "Computer")} #${c.id}
       <small>${c.turtle ? "turtle" : c.pocket ? "pocket" : "computer"}${c.advanced ? " · advanced" : ""}</small>
-    </button>`).join("") || `<p class="muted">No computers yet. Run the agent in-game.</p>`;
-  for (const b of $("#list").querySelectorAll(".comp")) b.onclick = () => { selected = Number(b.dataset.id); renderList(); renderDetail(true); };
+    </button>`).join("") || `<p class="muted">No computers yet. Run the agent in-game.</p>`);
+  $("#libBtn").onclick = () => { selected = "lib"; renderList(); renderLibrary(); };
+  for (const b of $("#list").querySelectorAll(".comp[data-id]")) {
+    const id = Number(b.dataset.id);
+    b.onclick = () => { selected = id; renderList(); renderDetail(true); };
+    // Drop onto a computer in the list: copy into its root folder.
+    makeDropTarget(b, async (items) => {
+      if (!computers.find((x) => x.id === id)?.online) throw new Error(`#${id} is offline`);
+      await uploadTo(id, "/", items);
+      if (selected === id) loadFiles(id, filesPath[id] || "/");
+    });
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Script library
+// ---------------------------------------------------------------------------
+
+async function renderLibrary() {
+  $("#detail").dataset.id = "lib";
+  $("#detail").innerHTML = `
+    <h2>Script library</h2>
+    <p class="muted">Drag a script onto a computer in the list (or into its file browser) to install it, or use the
+      wget line in-game. Drop .lua files from your desktop here to add them to the library.</p>
+    <div class="lib" id="lib"><p class="muted">Loading...</p></div>
+    <div id="libViewer" hidden>
+      <div class="vhead"><strong id="libVname"></strong><button class="b" id="libVclose">Close</button></div>
+      <pre class="code" id="libVcode"></pre>
+    </div>`;
+  const lib = $("#lib");
+  makeDropTarget(lib, async (items) => {
+    for (const it of items) await apiRaw("PUT", `scripts/${encodeURIComponent(it.name)}`, it.data);
+    toast(`Added ${items.map((i) => i.name).join(", ")} to the library`);
+    renderLibrary();
+  });
+  $("#libVclose").onclick = () => { $("#libViewer").hidden = true; };
+  let scripts;
+  try { scripts = await api("GET", "scripts"); } catch (e) { lib.innerHTML = `<p class="muted">Error: ${esc(e.message)}</p>`; return; }
+  if (selected !== "lib") return;
+  lib.innerHTML = scripts.map((s) => `
+    <div class="script" draggable="true" data-name="${esc(s.name)}">
+      <strong>${esc(s.name)}</strong> <small class="muted">${fmtSize(s.size)}</small>
+      <div class="sdesc">${esc(s.description || "")}</div>
+      <div class="bar">
+        <button class="b" data-view>View</button>
+        <button class="b" data-dl>Download</button>
+        <code>wget ${esc(s.url)} ${esc(s.name)}</code>
+        <button class="link" data-copy>copy</button>
+      </div>
+    </div>`).join("") || `<p class="muted">No scripts yet. Drop some .lua files here.</p>`;
+  for (const el of lib.querySelectorAll(".script")) {
+    const s = scripts.find((x) => x.name === el.dataset.name);
+    el.ondragstart = (e) => {
+      e.dataTransfer.setData("application/x-ccbridge-script", s.name);
+      e.dataTransfer.effectAllowed = "copy";
+    };
+    const text = async () => (await fetch(base + "scripts/" + encodeURIComponent(s.name))).text();
+    el.querySelector("[data-view]").onclick = async () => {
+      $("#libVname").textContent = s.name;
+      $("#libVcode").textContent = await text();
+      $("#libViewer").hidden = false;
+      $("#libViewer").scrollIntoView({ behavior: "smooth" });
+    };
+    el.querySelector("[data-dl]").onclick = async () => saveBlob(new Blob([await text()], { type: "text/plain" }), s.name);
+    el.querySelector("[data-copy]").onclick = async () => {
+      try { await navigator.clipboard.writeText(`wget ${s.url} ${s.name}`); toast("Copied wget command"); }
+      catch { toast("Could not copy; select the text instead"); }
+    };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// File browser for the selected computer
+// ---------------------------------------------------------------------------
+
+const filesPath = {}; // computer id -> folder being shown
+
+async function loadFiles(id, dir) {
+  const table = $("#ftable");
+  if (!table || selected !== id) return;
+  filesPath[id] = dir;
+  let listing;
+  try { listing = await api("GET", `computers/${id}/files?path=${encodeURIComponent(dir)}`); }
+  catch (e) { table.innerHTML = `<tr><td class="muted">${esc(e.message)}</td></tr>`; return; }
+  if (selected !== id) return;
+  $("#fpath").textContent = listing.path;
+  const entries = [...listing.entries].sort((a, b) => (b.dir - a.dir) || a.name.localeCompare(b.name));
+  const rows = [];
+  if (listing.path !== "/") rows.push(`<tr><td><button class="link" data-cd="..">..</button></td><td></td><td></td></tr>`);
+  for (const e of entries) {
+    const name = esc(e.name);
+    rows.push(e.dir
+      ? `<tr><td><button class="link" data-cd="${name}">${name}/</button></td><td class="size"></td><td></td></tr>`
+      : `<tr><td>${name}</td><td class="size">${fmtSize(e.size)}</td>
+           <td class="act"><button class="link" data-view="${name}">view</button> &middot;
+           <button class="link" data-dl="${name}">download</button></td></tr>`);
+  }
+  table.innerHTML = rows.join("") || `<tr><td class="muted">(empty folder)</td></tr>`;
+  for (const b of table.querySelectorAll("[data-cd]")) {
+    b.onclick = () => {
+      const to = b.dataset.cd === ".." ? listing.path.replace(/\/[^/]+\/?$/, "") || "/" : joinPath(listing.path, b.dataset.cd);
+      loadFiles(id, to);
+    };
+  }
+  const fetchFile = async (name) => (await apiRaw("GET", `computers/${id}/file?path=${encodeURIComponent(joinPath(listing.path, name))}`)).blob();
+  for (const b of table.querySelectorAll("[data-view]")) {
+    b.onclick = async () => {
+      try {
+        $("#vname").textContent = joinPath(listing.path, b.dataset.view);
+        $("#vcode").textContent = await (await fetchFile(b.dataset.view)).text();
+        $("#viewer").hidden = false;
+      } catch (e) { toast("Error: " + e.message); }
+    };
+  }
+  for (const b of table.querySelectorAll("[data-dl]")) {
+    b.onclick = async () => {
+      try { saveBlob(await fetchFile(b.dataset.dl), b.dataset.dl); } catch (e) { toast("Error: " + e.message); }
+    };
+  }
 }
 
 function renderScreen() {
@@ -193,8 +400,24 @@ function renderDetail(fresh) {
         <div class="bar"><button class="b" id="run">Run (Ctrl+Enter)</button></div>
         <pre class="out" id="out" hidden></pre>
       </div>
+    </div>
+    <div class="files" id="files">
+      <h2>Files <span id="fpath"></span> <button class="link" id="frefresh">refresh</button></h2>
+      <p class="muted">Drop files from your desktop, or scripts from the library, here to copy them into this folder.</p>
+      <table id="ftable"><tr><td class="muted">Loading...</td></tr></table>
+      <div id="viewer" hidden>
+        <div class="vhead"><strong id="vname"></strong><button class="b" id="vclose">Close</button></div>
+        <pre class="code" id="vcode"></pre>
+      </div>
     </div>`;
   renderScreen();
+  makeDropTarget($("#files"), async (items) => {
+    await uploadTo(c.id, filesPath[c.id] || "/", items);
+    loadFiles(c.id, filesPath[c.id] || "/");
+  });
+  $("#frefresh").onclick = () => loadFiles(c.id, filesPath[c.id] || "/");
+  $("#vclose").onclick = () => { $("#viewer").hidden = true; };
+  loadFiles(c.id, filesPath[c.id] || "/");
 
   const term = $("#term");
   term.onkeydown = (e) => {

@@ -67,6 +67,14 @@ Give computers labels (`label set miner1`) so they're easy to tell apart. Later 
 
 Open `https://nucnec.de/cc/`, log in with the `API_TOKEN`. Click a computer, click the screen and type.
 
+**Script library.** Lua programs in `scripts/` are listed under "Script library" (description = the file's leading
+`--` comment) and served publicly at `/scripts/<name>`, so in-game `wget <PUBLIC_URL>/scripts/<name> <name>` works.
+Drop `.lua` files onto the library to add them.
+
+**Files.** Each computer's page has a file browser (view, download). Drag files from your desktop or scripts from the
+library onto it, or onto a computer in the sidebar, to copy them there. Transfers go through `eval` as base64, so no
+agent update is needed; files are limited to 64 KiB (CC caps websocket messages at 128 KiB).
+
 ## 4. Claude Code
 
 On the VPS (or any machine that can reach the relay):
@@ -88,6 +96,11 @@ All endpoints need `Authorization: Bearer <API_TOKEN>`.
 | Method & path | Body | Result |
 | --- | --- | --- |
 | `GET /api/computers` | | list with online status |
+| `GET /api/scripts` | | script library: `[{ name, size, description, url }]` |
+| `PUT /api/scripts/:name` | file bytes | add or replace a library script |
+| `GET /api/computers/:id/files?path=` | | `{ path, entries: [{ name, dir, size, readOnly }] }` |
+| `GET /api/computers/:id/file?path=` | | file download |
+| `PUT /api/computers/:id/file?path=` | file bytes | write a file (folders are created) |
 | `GET /api/computers/:id/screen` | | `{ screen, cursor }` as text (`?format=raw` for colours) |
 | `POST /api/computers/:id/run` | `{ command, wait? }` | types command + Enter, returns settled screen |
 | `POST /api/computers/:id/input` | `{ text?, enter?, events? }` | raw input (`["key","up"]`, `["char","y"]`, `["paste","…"]`, `["terminate"]`) |

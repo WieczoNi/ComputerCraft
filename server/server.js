@@ -2,16 +2,17 @@
 // Claude Code (via the REST API / MCP server) talk to them through it.
 
 import { createServer } from "node:http";
-import { readFile } from "node:fs/promises";
+import { readFile, readdir, writeFile, mkdir } from "node:fs/promises";
 import { timingSafeEqual, randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { WebSocketServer } from "ws";
-import { toLua, statusCode as statusLua } from "./lua.js";
+import { toLua, statusCode as statusLua, listFilesCode, readFileCode, writeFileCode, MAX_FILE_BYTES } from "./lua.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const AGENT_PATH = path.join(here, "..", "lua", "agent.lua");
 const PUBLIC_DIR = path.join(here, "public");
+const SCRIPTS_DIR = path.join(here, "..", "scripts");
 
 const PORT = Number(process.env.PORT || 8080);
 const HOST = process.env.HOST || "127.0.0.1";
@@ -224,6 +225,57 @@ async function readBody(req) {
   try { return JSON.parse(Buffer.concat(chunks).toString()); } catch { throw httpError(400, "invalid JSON"); }
 }
 
+async function readRaw(req, limit) {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > limit) throw httpError(413, `file too large (max ${limit} bytes)`);
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks);
+}
+
+// ---------------------------------------------------------------------------
+// Script library: plain files in ../scripts, readable by anyone (for wget in-game)
+// ---------------------------------------------------------------------------
+
+const SCRIPT_NAME = /^[A-Za-z0-9_-][A-Za-z0-9_.-]{0,63}$/;
+
+function scriptPath(name) {
+  if (!SCRIPT_NAME.test(name)) throw httpError(400, "invalid script name");
+  return path.join(SCRIPTS_DIR, name);
+}
+
+/** The leading `--` comment block of a script, as its description. */
+function describe(src) {
+  const lines = [];
+  for (const line of src.split("\n")) {
+    const m = line.match(/^--\s?(.*)$/);
+    if (!m) break;
+    lines.push(m[1]);
+  }
+  return lines.join("\n").trim();
+}
+
+async function listScripts() {
+  await mkdir(SCRIPTS_DIR, { recursive: true });
+  const out = [];
+  for (const name of (await readdir(SCRIPTS_DIR)).sort()) {
+    if (!SCRIPT_NAME.test(name)) continue;
+    const src = await readFile(path.join(SCRIPTS_DIR, name), "utf8");
+    out.push({ name, size: Buffer.byteLength(src), description: describe(src), url: `${PUBLIC_URL}/scripts/${name}` });
+  }
+  return out;
+}
+
+/** Run Lua on a computer and return its first value, turning Lua errors into HTTP 400s. */
+async function evalValue(c, code, timeout) {
+  const r = await call(c, "eval", { code }, timeout);
+  if (!r.ok) throw httpError(400, r.error || "lua error");
+  return r.values[0];
+}
+
 function bearer(req) {
   const h = req.headers.authorization || "";
   return h.startsWith("Bearer ") ? h.slice(7) : null;
@@ -261,6 +313,16 @@ async function route(req, res) {
     res.end(src.replaceAll("__CCBRIDGE_URL__", PUBLIC_URL));
     return;
   }
+  const sm = p.match(/^\/scripts\/([^/]+)$/);
+  if (req.method === "GET" && sm) {
+    let src;
+    try { src = await readFile(scriptPath(decodeURIComponent(sm[1]))); } catch (e) {
+      throw e.status ? e : httpError(404, "no such script");
+    }
+    res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
+    res.end(src);
+    return;
+  }
   if (req.method === "GET" && STATIC[p]) {
     const [file, type] = STATIC[p];
     res.writeHead(200, { "content-type": type });
@@ -273,6 +335,17 @@ async function route(req, res) {
   if (req.method === "GET" && p === "/api/computers") {
     return json(res, 200, [...computers.values()].map(summary));
   }
+  if (req.method === "GET" && p === "/api/scripts") {
+    return json(res, 200, await listScripts());
+  }
+  const lm = p.match(/^\/api\/scripts\/([^/]+)$/);
+  if (lm && req.method === "PUT") {
+    const file = scriptPath(decodeURIComponent(lm[1]));
+    const data = await readRaw(req, MAX_FILE_BYTES);
+    await mkdir(SCRIPTS_DIR, { recursive: true });
+    await writeFile(file, data);
+    return json(res, 200, { name: path.basename(file), size: data.length });
+  }
 
   const m = p.match(/^\/api\/computers\/(\d+)\/([a-z]+)$/);
   if (!m) throw httpError(404, "not found");
@@ -283,6 +356,28 @@ async function route(req, res) {
     if (!c) throw httpError(404, `unknown computer ${id}`);
     if (url.searchParams.get("format") === "raw") return json(res, 200, c.screen ?? null);
     return json(res, 200, { online: c.online, screen: screenText(c.screen), cursor: c.screen?.cursor ?? null });
+  }
+
+  if (action === "files" || action === "file") {
+    const c = getComputer(id);
+    const target = url.searchParams.get("path") || "/";
+    if (req.method === "GET" && action === "files") {
+      return json(res, 200, await evalValue(c, listFilesCode(target), 15000));
+    }
+    if (req.method === "GET" && action === "file") {
+      const v = await evalValue(c, readFileCode(target), 30000);
+      res.writeHead(200, {
+        "content-type": "application/octet-stream",
+        "content-disposition": `attachment; filename="${path.posix.basename(target).replace(/[^\w.-]/g, "_")}"`,
+      });
+      res.end(Buffer.from(v.data, "base64"));
+      return;
+    }
+    if (req.method === "PUT" && action === "file") {
+      const data = await readRaw(req, MAX_FILE_BYTES);
+      return json(res, 200, await evalValue(c, writeFileCode(target, data.toString("base64")), 30000));
+    }
+    throw httpError(405, "method not allowed");
   }
 
   if (req.method !== "POST") throw httpError(405, "method not allowed");
